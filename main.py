@@ -1,311 +1,400 @@
 #!/usr/bin/env python3
 """
-Enhanced RFID Socket Server
-Writes to Block 8 (IDs) and Block 9 (WAREHOUSE_IN)
-Includes retry mechanism for failed writes
+RFID Operations GUI Monitor
+Real-time monitoring of RFID operations with both IN and OUT devices
 """
 
-import socket
+import tkinter as tk
+from tkinter import ttk, messagebox
 import threading
-import time
+import socket
 import json
+import time
 from datetime import datetime
+import queue
+import os
+from collections import defaultdict
+import csv
 
-# Configuration
-SERVER_HOST = "0.0.0.0"
-SERVER_PORT = 1234
-MAX_WRITE_RETRIES = 3
-RETRY_DELAY = 0.5  # seconds
-
-class EnhancedRFIDServer:
-    def __init__(self):
-        self.clients = {}
+class RFIDMonitorGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("RFID Warehouse Operations Monitor")
+        self.root.geometry("1200x800")
+        self.root.configure(bg='#2b2b2b')
+        
+        # Server configuration
+        self.server_host = "0.0.0.0"
+        self.server_port = 1234
+        self.server_socket = None
         self.running = False
+        
+        # Data tracking
+        self.clients = {}
+        self.operations_queue = queue.Queue()
         self.next_id = 1
         self.used_ids = set()
-        self.load_id_state()
+        self.device_stats = defaultdict(lambda: {'in_count': 0, 'out_count': 0, 'total': 0})
+
+        # CSV file for logging
+        self.csv_filename = "rfid_operations_log.csv"
+        self.init_csv_file()
         
-    def load_id_state(self):
-        """Load the current ID state from file"""
+        # Load saved state
+        self.load_state()
+        
+        # Create GUI
+        self.setup_gui()
+        
+        # Start server thread
+        self.start_server_thread()
+        
+        # Start GUI update thread
+        self.start_gui_update_thread()
+        
+        # Bind close event
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+    def init_csv_file(self):
+        """Create CSV file with header if it doesn't exist"""
+        if not os.path.exists(self.csv_filename):
+            with open(self.csv_filename, mode='w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(["Timestamp", "Device", "UID", "Operation", "Block8", "Block9", "Status"])
+
+    def setup_gui(self):
+        # Create main style
+        style = ttk.Style()
+        style.theme_use('clam')
+        style.configure('Title.TLabel', font=('Arial', 16, 'bold'), background='#2b2b2b', foreground='white')
+        style.configure('Header.TLabel', font=('Arial', 12, 'bold'), background='#2b2b2b', foreground='white')
+        style.configure('Status.TLabel', font=('Arial', 10), background='#2b2b2b')
+        
+        # Title
+        title_frame = tk.Frame(self.root, bg='#2b2b2b', height=60)
+        title_frame.pack(fill='x', padx=10, pady=5)
+        title_frame.pack_propagate(False)
+        
+        title_label = ttk.Label(title_frame, text="🏭 RFID Warehouse Operations Monitor", style='Title.TLabel')
+        title_label.pack(pady=15)
+        
+        # Main container
+        main_container = tk.Frame(self.root, bg='#2b2b2b')
+        main_container.pack(fill='both', expand=True, padx=10, pady=5)
+        
+        # Top row - Status and Stats
+        top_frame = tk.Frame(main_container, bg='#2b2b2b')
+        top_frame.pack(fill='x', pady=(0, 10))
+        
+        # Server status frame
+        status_frame = tk.LabelFrame(top_frame, text="Server Status", bg='#3b3b3b', fg='white', font=('Arial', 10, 'bold'))
+        status_frame.pack(side='left', fill='both', expand=True, padx=(0, 5))
+        
+        self.server_status_label = ttk.Label(status_frame, text="🔴 Stopped", style='Status.TLabel')
+        self.server_status_label.pack(pady=5)
+        
+        self.client_count_label = ttk.Label(status_frame, text="Connected Devices: 0", style='Status.TLabel')
+        self.client_count_label.pack(pady=2)
+        
+        self.port_label = ttk.Label(status_frame, text=f"Port: {self.server_port}", style='Status.TLabel')
+        self.port_label.pack(pady=2)
+        
+        # Statistics frame
+        stats_frame = tk.LabelFrame(top_frame, text="Operations Statistics", bg='#3b3b3b', fg='white', font=('Arial', 10, 'bold'))
+        stats_frame.pack(side='right', fill='both', expand=True, padx=(5, 0))
+        
+        self.total_operations_label = ttk.Label(stats_frame, text="Total Operations: 0", style='Status.TLabel')
+        self.total_operations_label.pack(pady=2)
+        
+        self.in_operations_label = ttk.Label(stats_frame, text="IN Operations: 0", style='Status.TLabel')
+        self.in_operations_label.pack(pady=2)
+        
+        self.out_operations_label = ttk.Label(stats_frame, text="OUT Operations: 0", style='Status.TLabel')
+        self.out_operations_label.pack(pady=2)
+        
+        self.next_id_label = ttk.Label(stats_frame, text=f"Next ID: {self.next_id}", style='Status.TLabel')
+        self.next_id_label.pack(pady=2)
+        
+        # Middle row - Connected Devices
+        devices_frame = tk.LabelFrame(main_container, text="Connected Devices", bg='#3b3b3b', fg='white', font=('Arial', 12, 'bold'))
+        devices_frame.pack(fill='x', pady=(0, 10))
+        
+        devices_columns = ('IP', 'Type', 'Status', 'Last Activity', 'IN Count', 'OUT Count', 'Total')
+        self.devices_tree = ttk.Treeview(devices_frame, columns=devices_columns, show='headings', height=4)
+        
+        for col in devices_columns:
+            self.devices_tree.heading(col, text=col)
+            self.devices_tree.column(col, width=120, anchor='center')
+        
+        devices_scrollbar = ttk.Scrollbar(devices_frame, orient='vertical', command=self.devices_tree.yview)
+        self.devices_tree.configure(yscrollcommand=devices_scrollbar.set)
+        
+        self.devices_tree.pack(side='left', fill='both', expand=True, padx=5, pady=5)
+        devices_scrollbar.pack(side='right', fill='y', pady=5)
+        
+        # Bottom row - Real-time Operations Log
+        log_frame = tk.LabelFrame(main_container, text="Latest Operation", bg='#3b3b3b', fg='white', font=('Arial', 12, 'bold'))
+        log_frame.pack(fill='both', expand=True)
+        
+        log_columns = ('Time', 'Device', 'UID', 'Operation', 'Block 8', 'Block 9', 'Status')
+        self.log_tree = ttk.Treeview(log_frame, columns=log_columns, show='headings')
+        
+        column_widths = {'Time': 150, 'Device': 120, 'UID': 120, 'Operation': 100, 
+                        'Block 8': 120, 'Block 9': 120, 'Status': 100}
+        
+        for col in log_columns:
+            self.log_tree.heading(col, text=col)
+            self.log_tree.column(col, width=column_widths.get(col, 100), anchor='center')
+        
+        log_scrollbar_y = ttk.Scrollbar(log_frame, orient='vertical', command=self.log_tree.yview)
+        log_scrollbar_x = ttk.Scrollbar(log_frame, orient='horizontal', command=self.log_tree.xview)
+        self.log_tree.configure(yscrollcommand=log_scrollbar_y.set, xscrollcommand=log_scrollbar_x.set)
+        
+        self.log_tree.pack(side='left', fill='both', expand=True, padx=5, pady=5)
+        log_scrollbar_y.pack(side='right', fill='y', pady=5)
+        log_scrollbar_x.pack(side='bottom', fill='x', padx=5)
+        
+        # Control buttons
+        button_frame = tk.Frame(main_container, bg='#2b2b2b')
+        button_frame.pack(fill='x', pady=5)
+        
+        self.restart_server_btn = tk.Button(button_frame, text="Restart Server", command=self.restart_server,
+                                           bg='#45b7d1', fg='white', font=('Arial', 10, 'bold'))
+        self.restart_server_btn.pack(side='right', padx=5)
+
+    def load_state(self):
+        """Load saved state from file"""
         try:
-            with open("id_state.json", "r") as f:
-                data = json.load(f)
-                self.next_id = data.get("next_id", 1)
-                self.used_ids = set(data.get("used_ids", []))
-                print(f"Loaded ID state: next_id={self.next_id}, used_ids count={len(self.used_ids)}")
-        except FileNotFoundError:
-            print("No previous ID state found, starting fresh")
+            if os.path.exists("gui_state.json"):
+                with open("gui_state.json", "r") as f:
+                    data = json.load(f)
+                    self.next_id = data.get("next_id", 1)
+                    self.used_ids = set(data.get("used_ids", []))
+                    self.device_stats = defaultdict(lambda: {'in_count': 0, 'out_count': 0, 'total': 0})
+                    for ip, stats in data.get("device_stats", {}).items():
+                        self.device_stats[ip] = stats
         except Exception as e:
-            print(f"Error loading ID state: {e}")
-    
-    def save_id_state(self):
-        """Save the current ID state to file"""
+            print(f"Error loading state: {e}")
+
+    def save_state(self):
+        """Save current state to file"""
         try:
             data = {
                 "next_id": self.next_id,
-                "used_ids": list(self.used_ids)
+                "used_ids": list(self.used_ids),
+                "device_stats": dict(self.device_stats),
+                "timestamp": datetime.now().isoformat()
             }
-            with open("id_state.json", "w") as f:
-                json.dump(data, f)
+            with open("gui_state.json", "w") as f:
+                json.dump(data, f, indent=2)
         except Exception as e:
-            print(f"Error saving ID state: {e}")
-    
+            print(f"Error saving state: {e}")
+
     def get_next_available_id(self):
-        """Get the next available ID"""
         while self.next_id in self.used_ids:
             self.next_id += 1
-        
         current_id = self.next_id
         self.used_ids.add(current_id)
         self.next_id += 1
-        self.save_id_state()
-        return str(current_id).zfill(8)  # Pad to 8 digits
-        
-    def start_server(self):
+        self.save_state()
+        return str(current_id).zfill(8)
+
+    def start_server_thread(self):
+        threading.Thread(target=self.run_server, daemon=True).start()
+
+    def start_gui_update_thread(self):
+        threading.Thread(target=self.update_gui_loop, daemon=True).start()
+
+    def run_server(self):
         try:
-            server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            server_socket.bind((SERVER_HOST, SERVER_PORT))
-            server_socket.listen(5)
-            
+            self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.server_socket.bind((self.server_host, self.server_port))
+            self.server_socket.listen(5)
             self.running = True
-            print(f"Enhanced RFID Server started on {SERVER_HOST}:{SERVER_PORT}")
-            
+            self.operations_queue.put(('server_status', f"🟢 Running on {self.server_host}:{self.server_port}"))
             while self.running:
                 try:
-                    client_socket, client_address = server_socket.accept()
-                    client_thread = threading.Thread(
-                        target=self.handle_client,
-                        args=(client_socket, client_address),
-                        daemon=True
-                    )
-                    client_thread.start()
+                    client_socket, client_address = self.server_socket.accept()
+                    threading.Thread(target=self.handle_client, args=(client_socket, client_address), daemon=True).start()
                 except Exception as e:
-                    print(f"Accept error: {e}")
-                    
+                    if self.running:
+                        print(f"Accept error: {e}")
         except Exception as e:
-            print(f"Server error: {e}")
-    
+            self.operations_queue.put(('server_status', f"🔴 Error: {e}"))
+
     def handle_client(self, client_socket, client_address):
         client_ip = client_address[0]
-        print(f"Client connected: {client_ip}")
-        
+        self.clients[client_ip] = {
+            'socket': client_socket,
+            'connected_time': datetime.now(),
+            'last_activity': datetime.now(),
+            'type': 'Unknown',
+            'status': 'Connected'
+        }
+        self.operations_queue.put(('client_connected', client_ip))
         try:
             while self.running:
                 data = client_socket.recv(1024)
                 if not data:
                     break
-                    
                 message = data.decode('utf-8').strip()
                 if not message:
                     continue
-                    
-                print(f"Received from {client_ip}: {message}")
-                
+                self.clients[client_ip]['last_activity'] = datetime.now()
                 response = self.process_message(message, client_ip, client_socket)
                 if response:
                     client_socket.send(f"{response}\n".encode('utf-8'))
-                    print(f"Sent to {client_ip}: {response}")
-                    
         except Exception as e:
             print(f"Client {client_ip} error: {e}")
         finally:
             client_socket.close()
-            print(f"Client {client_ip} disconnected")
-    
-    def send_write_command(self, client_socket, block, data, max_retries=MAX_WRITE_RETRIES):
-        """Send write command with retry mechanism"""
-        for attempt in range(max_retries):
-            try:
-                write_cmd = f"WRITE_BLOCK|BLOCK:{block}|DATA:{data}\n"
-                client_socket.send(write_cmd.encode('utf-8'))
-                print(f"Write attempt {attempt + 1}/{max_retries} - Block {block}: {data}")
-                
-                # Wait for response
-                client_socket.settimeout(5.0)  # 5 second timeout
-                response = client_socket.recv(1024).decode('utf-8').strip()
-                client_socket.settimeout(None)  # Reset timeout
-                
-                if response == "WRITE_SUCCESS":
-                    print(f"Successfully wrote to Block {block}")
-                    return True
-                elif response == "WRITE_FAILED":
-                    print(f"Write failed for Block {block}, attempt {attempt + 1}")
-                    if attempt < max_retries - 1:
-                        time.sleep(RETRY_DELAY)
-                        continue
-                else:
-                    print(f"Unexpected response: {response}")
-                    
-            except socket.timeout:
-                print(f"Timeout waiting for write response, attempt {attempt + 1}")
-            except Exception as e:
-                print(f"Write error on attempt {attempt + 1}: {e}")
-                
-            if attempt < max_retries - 1:
-                time.sleep(RETRY_DELAY)
-        
-        print(f"Failed to write to Block {block} after {max_retries} attempts")
-        return False
-    
-    def read_block(self, client_socket, block):
-        """Read data from a specific block"""
-        try:
-            read_cmd = f"READ_BLOCK|BLOCK:{block}\n"
-            client_socket.send(read_cmd.encode('utf-8'))
-            
-            client_socket.settimeout(5.0)
-            response = client_socket.recv(1024).decode('utf-8').strip()
-            client_socket.settimeout(None)
-            
-            if response.startswith("READ_SUCCESS|DATA:"):
-                data = response.split("READ_SUCCESS|DATA:")[1]
-                return data.strip()
-            else:
-                print(f"Failed to read Block {block}: {response}")
-                return None
-                
-        except Exception as e:
-            print(f"Read error for Block {block}: {e}")
-            return None
-    
+            if client_ip in self.clients:
+                del self.clients[client_ip]
+            self.operations_queue.put(('client_disconnected', client_ip))
+
     def process_message(self, message, client_ip, client_socket):
         try:
             parts = message.split('|')
             command = parts[0]
-            
             if command == "READER_WRITER_READY":
+                self.clients[client_ip]['type'] = 'RFID Reader'
+                self.clients[client_ip]['status'] = 'Ready'
                 return "ACK_READER_WRITER_READY"
-            
-            elif command == "RFID_DETECTED":
-                # Expected format: RFID_DETECTED|UID:xxxxx
-                card_uid = ""
-                
-                for part in parts[1:]:
-                    if part.startswith("UID:"):
-                        card_uid = part[4:]
-                        break
-                
-                if not card_uid:
-                    return "ERROR_NO_UID"
-                
-                print(f"Processing RFID card: {card_uid}")
-                
-                # Read current Block 8 data to check if ID already exists
-                current_block8_data = self.read_block(client_socket, 8)
-                
-                # Determine what to write to Block 8
-                if current_block8_data and current_block8_data.strip() and current_block8_data != "EMPTY":
-                    # Block 8 already has data, don't overwrite
-                    block8_data = current_block8_data
-                    print(f"Block 8 already contains ID: {block8_data}")
-                    write_block8 = False
-                else:
-                    # Block 8 is empty, assign new ID
-                    block8_data = self.get_next_available_id()
-                    print(f"Assigning new ID to Block 8: {block8_data}")
-                    write_block8 = True
-                
-                # Always write WAREHOUSE_IN to Block 9
-                block9_data = "WAREHOUSE_IN"
-                
-                # Perform writes
-                write_success = True
-                
-                if write_block8:
-                    if not self.send_write_command(client_socket, 8, block8_data):
-                        write_success = False
-                
-                if not self.send_write_command(client_socket, 9, block9_data):
-                    write_success = False
-                
-                # Log the operation
-                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                status = "SUCCESS" if write_success else "PARTIAL_FAILURE"
-                log_entry = (f"[{timestamp}] RFID Operation - "
-                           f"UID: {card_uid}, "
-                           f"Block8: {block8_data} {'(written)' if write_block8 else '(existing)'}, "
-                           f"Block9: {block9_data} (written), "
-                           f"Status: {status}")
-                
-                print(log_entry)
-                
-                # Write to log file
-                try:
-                    with open("rfid_operations.log", "a") as f:
-                        f.write(log_entry + "\n")
-                except Exception as e:
-                    print(f"File write error: {e}")
-                
-                if write_success:
-                    return "ACK_WRITE_SUCCESS"
-                else:
-                    return "ACK_WRITE_PARTIAL"
-            
             elif command == "RFID_LOG":
-                # Legacy support for old log format
-                card_uid = ""
-                block8_data = ""
-                block9_data = ""
-                sequence = ""
-                
+                card_uid, action, block8_data, block9_data = "", "", "", ""
                 for part in parts[1:]:
                     if part.startswith("UID:"):
                         card_uid = part[4:]
+                    elif part.startswith("ACTION:"):
+                        action = part[7:]
                     elif part.startswith("BLOCK8:"):
                         block8_data = part[7:]
                     elif part.startswith("BLOCK9:"):
                         block9_data = part[7:]
-                    elif part.startswith("SEQ:"):
-                        sequence = part[4:]
-                
-                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                log_entry = (f"[{timestamp}] RFID Log - "
-                           f"UID: {card_uid}, "
-                           f"Block8: {block8_data}, "
-                           f"Block9: {block9_data}, "
-                           f"Sequence: {sequence}")
-                
-                print(log_entry)
-                
-                try:
-                    with open("rfid_operations.log", "a") as f:
-                        f.write(log_entry + "\n")
-                except Exception as e:
-                    print(f"File write error: {e}")
-                
+                if "WAREHOUSE_IN" in block9_data:
+                    operation_type = "IN"
+                    self.device_stats[client_ip]['in_count'] += 1
+                elif "WAREHOUSE_OUT" in block9_data:
+                    operation_type = "OUT"
+                    self.device_stats[client_ip]['out_count'] += 1
+                else:
+                    operation_type = action if action else "UNKNOWN"
+                self.device_stats[client_ip]['total'] += 1
+                self.clients[client_ip]['type'] = f'RFID {operation_type} Reader'
+                operation_data = {
+                    'timestamp': datetime.now().strftime("%H:%M:%S"),
+                    'device': client_ip,
+                    'uid': card_uid,
+                    'operation': operation_type,
+                    'block8': block8_data,
+                    'block9': block9_data,
+                    'status': 'Success'
+                }
+                self.operations_queue.put(('rfid_operation', operation_data))
                 return "ACK_LOGGED"
-            
             elif command == "HEARTBEAT":
                 return "HEARTBEAT_ACK"
-            
-            elif command in ["WRITE_SUCCESS", "WRITE_FAILED", "READ_SUCCESS"]:
-                # These are responses to our commands, don't send a response back
-                return None
-            
             else:
                 return "ERROR_UNKNOWN_COMMAND"
-                
         except Exception as e:
             print(f"Message processing error: {e}")
             return "ERROR_PROCESSING"
 
+    def update_gui_loop(self):
+        while True:
+            try:
+                while not self.operations_queue.empty():
+                    operation_type, data = self.operations_queue.get_nowait()
+                    if operation_type == 'server_status':
+                        self.root.after(0, self.update_server_status, data)
+                    elif operation_type in ('client_connected', 'client_disconnected'):
+                        self.root.after(0, self.update_devices_display)
+                    elif operation_type == 'rfid_operation':
+                        self.root.after(0, self.add_operation_to_log, data)
+                self.root.after(0, self.update_statistics)
+                self.root.after(0, self.update_devices_display)
+                time.sleep(1)
+            except Exception as e:
+                print(f"GUI update error: {e}")
+                time.sleep(1)
+
+    def update_server_status(self, status):
+        self.server_status_label.config(text=status)
+
+    def update_devices_display(self):
+        for item in self.devices_tree.get_children():
+            self.devices_tree.delete(item)
+        for ip, info in self.clients.items():
+            stats = self.device_stats[ip]
+            last_activity = info['last_activity'].strftime("%H:%M:%S")
+            self.devices_tree.insert('', 'end', values=(
+                ip, info['type'], info['status'], last_activity,
+                stats['in_count'], stats['out_count'], stats['total']
+            ))
+        self.client_count_label.config(text=f"Connected Devices: {len(self.clients)}")
+
+    def update_statistics(self):
+        total_operations = sum(stats['total'] for stats in self.device_stats.values())
+        total_in = sum(stats['in_count'] for stats in self.device_stats.values())
+        total_out = sum(stats['out_count'] for stats in self.device_stats.values())
+        self.total_operations_label.config(text=f"Total Operations: {total_operations}")
+        self.in_operations_label.config(text=f"IN Operations: {total_in}")
+        self.out_operations_label.config(text=f"OUT Operations: {total_out}")
+        self.next_id_label.config(text=f"Next ID: {self.next_id}")
+
+    def add_operation_to_log(self, operation_data):
+        # Append to CSV
+        try:
+            with open(self.csv_filename, mode='a', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    operation_data['timestamp'],
+                    operation_data['device'],
+                    operation_data['uid'],
+                    operation_data['operation'],
+                    operation_data['block8'],
+                    operation_data['block9'],
+                    operation_data['status']
+                ])
+        except Exception as e:
+            print(f"CSV logging error: {e}")
+
+        # Show only the latest operation
+        for item in self.log_tree.get_children():
+            self.log_tree.delete(item)
+        self.log_tree.insert('', 0, values=(
+            operation_data['timestamp'],
+            operation_data['device'],
+            operation_data['uid'],
+            operation_data['operation'],
+            operation_data['block8'],
+            operation_data['block9'],
+            operation_data['status']
+        ))
+
+    def restart_server(self):
+        if messagebox.askyesno("Confirm", "Restart the RFID server?"):
+            self.running = False
+            if self.server_socket:
+                self.server_socket.close()
+            self.clients.clear()
+            self.root.after(2000, self.restart_server_delayed)
+
+    def restart_server_delayed(self):
+        self.start_server_thread()
+
+    def on_closing(self):
+        self.save_state()
+        self.running = False
+        if self.server_socket:
+            self.server_socket.close()
+        self.root.destroy()
+
 def main():
-    print("=== Enhanced RFID Server with Block Writing ===")
-    print("Features:")
-    print("- Automatic ID assignment to Block 8")
-    print("- WAREHOUSE_IN writing to Block 9")
-    print("- Write retry mechanism")
-    print("- ID state persistence")
-    print()
-    
-    server = EnhancedRFIDServer()
-    
-    try:
-        server.start_server()
-    except KeyboardInterrupt:
-        print("\nShutting down server...")
-        server.running = False
+    root = tk.Tk()
+    app = RFIDMonitorGUI(root)
+    root.mainloop()
 
 if __name__ == "__main__":
     main()

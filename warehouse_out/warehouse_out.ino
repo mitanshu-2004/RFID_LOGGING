@@ -3,13 +3,13 @@
 #include <MFRC522.h>
 
 // WiFi credentials
-const char* ssid = "COMPUTER LAB 2.4";
-const char* password = "IIPDELHI@1234";
+const char* ssid = "mitanshu";
+const char* password = "qwerty123";
 
 // Server details
-const char* server_ip = "192.168.1.104";
+const char* server_ip = "10.102.191.109";
 const uint16_t server_port = 1234;
-WiFiClient client;
+WiFiClient client; 
 
 // RFID pins
 #define RFID_SS_PIN    5
